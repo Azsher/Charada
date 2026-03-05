@@ -375,6 +375,11 @@ export default function GameRoom({ code }: GameRoomProps) {
         const { data: latestRoom } = await supabase.from('rooms').select('*').eq('id', room.id).single();
         const { data: latestTeams } = await supabase.from('teams').select('*').eq('room_id', room.id).order('team_number', { ascending: true });
 
+        if (!latestTeams || latestTeams.length < 2) {
+            toast.error('Error al obtener los equipos');
+            return;
+        }
+
         if (latestRoom.current_round > latestRoom.rounds) {
             const t1 = latestTeams[0].score;
             const t2 = latestTeams[1].score;
