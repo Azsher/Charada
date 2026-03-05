@@ -59,6 +59,7 @@ export default function GameRoom({ code }: GameRoomProps) {
 
     const timerRef = useRef<NodeJS.Timeout | null>(null);
     const performingTimerRef = useRef<NodeJS.Timeout | null>(null);
+    const celebrationTimerRef = useRef<NodeJS.Timeout | null>(null);
 
     // Fetch initial data
     useEffect(() => {
@@ -136,7 +137,13 @@ export default function GameRoom({ code }: GameRoomProps) {
                 if (payload.type === 'countdown') setCountdown(payload.value);
                 if (payload.type === 'performing_timer') setPerformingTimer(payload.value);
                 if (payload.type === 'score_button_state') setScoreButtonDisabled(payload.disabled);
-                if (payload.type === 'celebration') setLastScoringTeam(payload.team);
+                if (payload.type === 'celebration') {
+                    setLastScoringTeam(payload.team);
+                    // Ensure all clients see celebration
+                    if (!player?.is_host) {
+                        setPhase('celebration');
+                    }
+                }
                 if (payload.type === 'tiebreaker') {
                     setTiebreakerCategoryIds(payload.categoryIds);
                     setSelectedCategoryId(null);
@@ -159,6 +166,7 @@ export default function GameRoom({ code }: GameRoomProps) {
             supabase.removeChannel(channel);
             if (timerRef.current) clearInterval(timerRef.current);
             if (performingTimerRef.current) clearInterval(performingTimerRef.current);
+            if (celebrationTimerRef.current) clearTimeout(celebrationTimerRef.current);
         };
     }, [code, room?.id, player?.id, router]);
 
@@ -214,18 +222,39 @@ export default function GameRoom({ code }: GameRoomProps) {
 
     // Auto-advance from celebration to next round
     useEffect(() => {
-        if (phase === 'celebration' && player?.is_host) {
-            const timer = setTimeout(async () => {
-                // Update round to trigger next round
-                const newRound = room.current_round + 1;
-                await supabase.from('rooms').update({ current_round: newRound }).eq('id', room.id);
+        if (phase === 'celebration' && player?.is_host && room?.id) {
+            // Clear any existing timer
+            if (celebrationTimerRef.current) {
+                clearTimeout(celebrationTimerRef.current);
+            }
+            
+            console.log('Starting celebration timer, current round:', room.current_round);
+            const currentRound = room.current_round;
+            const roomId = room.id;
+            
+            celebrationTimerRef.current = setTimeout(async () => {
+                console.log('Celebration ended, advancing to next round');
+                const newRound = currentRound + 1;
                 
-                prevRoundRef.current = newRound; // Update ref to prevent double trigger
-                runRound();
+                // Update round in database
+                const { error } = await supabase.from('rooms').update({ current_round: newRound }).eq('id', roomId);
+                if (error) {
+                    console.error('Error updating round:', error);
+                } else {
+                    console.log('Round updated to:', newRound);
+                    prevRoundRef.current = newRound;
+                    runRound();
+                }
             }, 10000); // 10 seconds celebration
-            return () => clearTimeout(timer);
+            
+            return () => {
+                console.log('Cleaning up celebration timer');
+                if (celebrationTimerRef.current) {
+                    clearTimeout(celebrationTimerRef.current);
+                }
+            };
         }
-    }, [phase, player?.is_host, room?.current_round]);
+    }, [phase, player?.is_host, room?.id]);
 
     const getDeterministicIndex = (seedText: string, max: number) => {
         let hash = 0;
@@ -384,9 +413,13 @@ export default function GameRoom({ code }: GameRoomProps) {
             return;
         }
 
-        if (latestRoom.current_round > latestRoom.rounds) {
-            const t1 = latestTeams[0].score;
-            const t2 = latestTeams[1].score;
+        // Check if any team reached the target score (rounds field is used as target score)
+        const t1 = latestTeams[0].score;
+        const t2 = latestTeams[1].score;
+        const targetScore = latestRoom.rounds; // Using 'rounds' field as target score
+        
+        if (t1 >= targetScore || t2 >= targetScore) {
+            // Game over - someone reached the target
             const win = t1 > t2 ? 1 : (t2 > t1 ? 2 : 0);
             await supabase.from('rooms').update({ status: 'results' }).eq('id', room.id);
             broadcastEvent('winner', { team: win });
@@ -486,9 +519,13 @@ export default function GameRoom({ code }: GameRoomProps) {
                 
                 if (timeLeft <= 0) {
                     if (performingTimerRef.current) clearInterval(performingTimerRef.current);
-                    // Auto-advance to next round if time runs out
+                    // Auto-advance to next round if time runs out without scoring
+                    console.log('Time ran out, advancing to next round');
                     const newRound = room.current_round + 1;
-                    supabase.from('rooms').update({ current_round: newRound }).eq('id', room.id);
+                    supabase.from('rooms').update({ current_round: newRound }).eq('id', room.id).then(() => {
+                        prevRoundRef.current = newRound;
+                        runRound();
+                    });
                 }
             }, 1000);
         }
@@ -510,12 +547,16 @@ export default function GameRoom({ code }: GameRoomProps) {
             .update({ score: team.score + 1 })
             .eq('id', team.id);
 
-        // Show celebration screen
+        // Show celebration screen for all players
         setLastScoringTeam(teamIndex + 1);
         broadcastEvent('celebration', { team: teamIndex + 1 });
         
+        // Only host updates the room status
         if (player?.is_host) {
             await supabase.from('rooms').update({ status: 'celebration' }).eq('id', room.id);
+        } else {
+            // Non-host players also need to see celebration, so set phase locally
+            setPhase('celebration');
         }
     };
 
@@ -581,9 +622,9 @@ export default function GameRoom({ code }: GameRoomProps) {
                         ))}
                     </div>
                     <div className="text-right">
-                        <div className="text-[10px] opacity-40 uppercase font-bold tracking-widest">Ronda Actual</div>
+                        <div className="text-[10px] opacity-40 uppercase font-bold tracking-widest">Objetivo</div>
                         <div className="text-2xl font-black text-pink-500 font-mono">
-                            {Math.min(room.current_round, room.rounds)} <span className="text-white/20 text-sm">/ {room.rounds}</span>
+                            {room.rounds} <span className="text-white/20 text-sm">puntos</span>
                         </div>
                     </div>
                 </div>
