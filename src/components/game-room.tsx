@@ -41,20 +41,24 @@ export default function GameRoom({ code }: GameRoomProps) {
     const [tiebreakerCategoryIds, setTiebreakerCategoryIds] = useState<string[]>([]);
 
     // Game State
-    const [phase, setPhase] = useState<'joining' | 'lobby' | 'voting' | 'countdown_performer' | 'countdown_ready' | 'performing' | 'results'>('joining');
+    const [phase, setPhase] = useState<'joining' | 'lobby' | 'voting' | 'countdown_performer' | 'countdown_ready' | 'performing' | 'celebration' | 'results'>('joining');
     const [countdown, setCountdown] = useState<number>(0);
     const [performer1, setPerformer1] = useState<any>(null);
     const [performer2, setPerformer2] = useState<any>(null);
     const [currentWord, setCurrentWord] = useState<string | null>(null);
     const [winnerTeam, setWinnerTeam] = useState<number | null>(null);
+    const [lastScoringTeam, setLastScoringTeam] = useState<number | null>(null);
     const [showWord, setShowWord] = useState(true);
     const [winnerModal, setWinnerModal] = useState<{ name: string, type: 'category' | 'tiebreaker' } | null>(null);
     const [isCustomModalOpen, setIsCustomModalOpen] = useState(false);
     const [customWordInput, setCustomWordInput] = useState('');
     const [activeCustomWord, setActiveCustomWord] = useState<string | null>(null);
     const [customVotes, setCustomVotes] = useState<any[]>([]);
+    const [performingTimer, setPerformingTimer] = useState<number>(45);
+    const [scoreButtonDisabled, setScoreButtonDisabled] = useState<boolean>(false);
 
     const timerRef = useRef<NodeJS.Timeout | null>(null);
+    const performingTimerRef = useRef<NodeJS.Timeout | null>(null);
 
     // Fetch initial data
     useEffect(() => {
@@ -130,6 +134,9 @@ export default function GameRoom({ code }: GameRoomProps) {
             })
             .on('broadcast', { event: 'game_event' }, ({ payload }) => {
                 if (payload.type === 'countdown') setCountdown(payload.value);
+                if (payload.type === 'performing_timer') setPerformingTimer(payload.value);
+                if (payload.type === 'score_button_state') setScoreButtonDisabled(payload.disabled);
+                if (payload.type === 'celebration') setLastScoringTeam(payload.team);
                 if (payload.type === 'tiebreaker') {
                     setTiebreakerCategoryIds(payload.categoryIds);
                     setSelectedCategoryId(null);
@@ -151,6 +158,7 @@ export default function GameRoom({ code }: GameRoomProps) {
         return () => {
             supabase.removeChannel(channel);
             if (timerRef.current) clearInterval(timerRef.current);
+            if (performingTimerRef.current) clearInterval(performingTimerRef.current);
         };
     }, [code, room?.id, player?.id, router]);
 
@@ -158,7 +166,7 @@ export default function GameRoom({ code }: GameRoomProps) {
     const prevRoundRef = useRef<number>(1);
     useEffect(() => {
         if (player?.is_host && room) {
-            if (room.status !== 'lobby' && room.status !== 'joining' && room.status !== 'results' && room.current_round > prevRoundRef.current) {
+            if (room.status !== 'lobby' && room.status !== 'joining' && room.status !== 'results' && room.status !== 'celebration' && room.current_round > prevRoundRef.current) {
                 prevRoundRef.current = room.current_round;
                 runRound();
             }
@@ -193,6 +201,27 @@ export default function GameRoom({ code }: GameRoomProps) {
             return () => clearTimeout(timer);
         }
     }, [phase]);
+
+    // Reset score button when entering performing phase or round changes
+    useEffect(() => {
+        if (phase === 'performing') {
+            setScoreButtonDisabled(false);
+        } else {
+            // Disable button when not in performing phase to prevent accidental clicks during transitions
+            setScoreButtonDisabled(true);
+        }
+    }, [phase, room?.current_round]);
+
+    // Auto-advance from celebration to next round
+    useEffect(() => {
+        if (phase === 'celebration' && player?.is_host) {
+            const timer = setTimeout(() => {
+                prevRoundRef.current = room.current_round; // Update ref to prevent double trigger
+                runRound();
+            }, 10000); // 10 seconds celebration
+            return () => clearTimeout(timer);
+        }
+    }, [phase, player?.is_host]);
 
     const getDeterministicIndex = (seedText: string, max: number) => {
         let hash = 0;
@@ -344,19 +373,20 @@ export default function GameRoom({ code }: GameRoomProps) {
         if (!player?.is_host) return;
 
         const { data: latestRoom } = await supabase.from('rooms').select('*').eq('id', room.id).single();
+        const { data: latestTeams } = await supabase.from('teams').select('*').eq('room_id', room.id).order('team_number', { ascending: true });
 
         if (latestRoom.current_round > latestRoom.rounds) {
-            const t1 = teams[0].score;
-            const t2 = teams[1].score;
+            const t1 = latestTeams[0].score;
+            const t2 = latestTeams[1].score;
             const win = t1 > t2 ? 1 : (t2 > t1 ? 2 : 0);
             await supabase.from('rooms').update({ status: 'results' }).eq('id', room.id);
             broadcastEvent('winner', { team: win });
-            setWinnerTeam(win); // Fix for host screen showing Null
+            setWinnerTeam(win);
             return;
         }
 
-        const t1p = players.filter(p => p.team_id === teams[0].id).sort((a, b) => a.id.localeCompare(b.id));
-        const t2p = players.filter(p => p.team_id === teams[1].id).sort((a, b) => a.id.localeCompare(b.id));
+        const t1p = players.filter(p => p.team_id === latestTeams[0].id).sort((a, b) => a.id.localeCompare(b.id));
+        const t2p = players.filter(p => p.team_id === latestTeams[1].id).sort((a, b) => a.id.localeCompare(b.id));
 
         if (t1p.length === 0 || t2p.length === 0) {
             toast.error('Faltan jugadores en los equipos');
@@ -428,17 +458,60 @@ export default function GameRoom({ code }: GameRoomProps) {
         setCurrentWord(word);
         broadcastEvent('word', { word });
         broadcastEvent('performers', { p1, p2 });
+
+        // Reset score button and broadcast to all clients
+        setScoreButtonDisabled(false);
+        broadcastEvent('score_button_state', { disabled: false });
+        
+        // Only host manages the timer to keep all clients in sync
+        if (player?.is_host) {
+            setPerformingTimer(45);
+            broadcastEvent('performing_timer', { value: 45 });
+            
+            if (performingTimerRef.current) clearInterval(performingTimerRef.current);
+            let timeLeft = 45;
+            performingTimerRef.current = setInterval(() => {
+                timeLeft--;
+                setPerformingTimer(timeLeft);
+                broadcastEvent('performing_timer', { value: timeLeft });
+                
+                if (timeLeft <= 0) {
+                    if (performingTimerRef.current) clearInterval(performingTimerRef.current);
+                    // Auto-advance to next round if time runs out
+                    const newRound = room.current_round + 1;
+                    supabase.from('rooms').update({ current_round: newRound }).eq('id', room.id);
+                }
+            }, 1000);
+        }
     };
 
     const handleScore = async (teamIndex: number) => {
+        if (scoreButtonDisabled) return;
+        
+        setScoreButtonDisabled(true);
+        broadcastEvent('score_button_state', { disabled: true });
+        
+        if (player?.is_host && performingTimerRef.current) {
+            clearInterval(performingTimerRef.current);
+        }
+        
         const team = teams[teamIndex];
         await supabase
             .from('teams')
             .update({ score: team.score + 1 })
             .eq('id', team.id);
 
-        const newRound = room.current_round + 1;
-        await supabase.from('rooms').update({ current_round: newRound }).eq('id', room.id);
+        // Show celebration screen
+        setLastScoringTeam(teamIndex + 1);
+        broadcastEvent('celebration', { team: teamIndex + 1 });
+        
+        if (player?.is_host) {
+            await supabase.from('rooms').update({ status: 'celebration' }).eq('id', room.id);
+            
+            // Update round after celebration
+            const newRound = room.current_round + 1;
+            await supabase.from('rooms').update({ current_round: newRound }).eq('id', room.id);
+        }
     };
 
     if (!room) return <div className="min-h-screen flex items-center justify-center bg-slate-950"><Loader2 className="animate-spin text-pink-500 h-12 w-12" /></div>;
@@ -650,6 +723,20 @@ export default function GameRoom({ code }: GameRoomProps) {
                     <div className="text-center space-y-12 py-10 animate-in slide-in-from-top-10 duration-500">
                         {isPerformer ? (
                             <div className="space-y-10 max-w-2xl mx-auto">
+                                {/* Mostrar número de equipo y timer */}
+                                <div className="flex justify-between items-center bg-slate-900/80 p-6 rounded-2xl border border-white/5 backdrop-blur-md shadow-xl">
+                                    <div className={`px-6 py-3 rounded-xl border ${player?.team_id === teams[0]?.id ? 'border-blue-500/50 bg-blue-500/10' : 'border-red-500/50 bg-red-500/10'}`}>
+                                        <div className={`text-xs uppercase font-bold tracking-wider ${player?.team_id === teams[0]?.id ? 'text-blue-400' : 'text-red-400'}`}>Tu Equipo</div>
+                                        <div className="text-4xl font-black">{player?.team_id === teams[0]?.id ? '1' : '2'}</div>
+                                    </div>
+                                    <div className="text-center">
+                                        <div className="text-xs opacity-40 uppercase font-bold tracking-widest mb-1">Tiempo</div>
+                                        <div className={`text-5xl font-black font-mono ${performingTimer <= 10 ? 'text-red-500 animate-pulse' : 'text-pink-500'}`}>
+                                            {performingTimer}s
+                                        </div>
+                                    </div>
+                                </div>
+
                                 <div className="space-y-4">
                                     <Badge className="text-sm px-4 py-1 bg-pink-600 rounded-full font-bold uppercase tracking-widest">
                                         {showWord ? 'Memoriza tu palabra' : '¡A actuar!'}
@@ -679,12 +766,22 @@ export default function GameRoom({ code }: GameRoomProps) {
 
                                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 pt-10">
                                     {(player?.is_host || player?.id === performer1?.id) && (
-                                        <Button onClick={() => handleScore(0)} size="lg" className="bg-blue-600 hover:bg-blue-500 h-24 text-2xl font-black rounded-2xl shadow-xl shadow-blue-600/20">
+                                        <Button 
+                                            onClick={() => handleScore(0)} 
+                                            disabled={scoreButtonDisabled}
+                                            size="lg" 
+                                            className="bg-blue-600 hover:bg-blue-500 h-24 text-2xl font-black rounded-2xl shadow-xl shadow-blue-600/20 disabled:opacity-50 disabled:cursor-not-allowed"
+                                        >
                                             EQUIPO 1 ACERTÓ
                                         </Button>
                                     )}
                                     {(player?.is_host || player?.id === performer2?.id) && (
-                                        <Button onClick={() => handleScore(1)} size="lg" className="bg-red-600 hover:bg-red-500 h-24 text-2xl font-black rounded-2xl shadow-xl shadow-red-600/20">
+                                        <Button 
+                                            onClick={() => handleScore(1)} 
+                                            disabled={scoreButtonDisabled}
+                                            size="lg" 
+                                            className="bg-red-600 hover:bg-red-500 h-24 text-2xl font-black rounded-2xl shadow-xl shadow-red-600/20 disabled:opacity-50 disabled:cursor-not-allowed"
+                                        >
                                             EQUIPO 2 ACERTÓ
                                         </Button>
                                     )}
@@ -693,6 +790,14 @@ export default function GameRoom({ code }: GameRoomProps) {
                             </div>
                         ) : (
                             <div className="space-y-8 max-w-2xl mx-auto py-10">
+                                {/* Timer para espectadores */}
+                                <div className="bg-slate-900/80 p-4 rounded-2xl border border-white/5 backdrop-blur-md shadow-xl inline-block mx-auto">
+                                    <div className="text-xs opacity-40 uppercase font-bold tracking-widest mb-1">Tiempo Restante</div>
+                                    <div className={`text-4xl font-black font-mono ${performingTimer <= 10 ? 'text-red-500 animate-pulse' : 'text-pink-500'}`}>
+                                        {performingTimer}s
+                                    </div>
+                                </div>
+
                                 <div className="relative">
                                     <Zap className="h-24 w-24 mx-auto text-pink-500 animate-glow" />
                                     <div className="absolute inset-0 bg-pink-500/20 blur-3xl rounded-full" />
@@ -708,6 +813,31 @@ export default function GameRoom({ code }: GameRoomProps) {
                                 </div>
                             </div>
                         )}
+                    </div>
+                )}
+
+                {phase === 'celebration' && (
+                    <div className="text-center space-y-12 py-20 animate-in zoom-in-50 duration-700">
+                        <div className="relative inline-block">
+                            <Sparkles className="h-32 w-32 mx-auto text-yellow-400 animate-pulse" />
+                            <div className="absolute inset-0 bg-yellow-400/30 blur-[100px] rounded-full animate-pulse" />
+                        </div>
+                        <div className="space-y-6">
+                            <h1 className="text-7xl sm:text-8xl font-black uppercase tracking-tighter text-transparent bg-clip-text bg-gradient-to-b from-pink-400 via-purple-400 to-indigo-400 animate-in slide-in-from-bottom-10 duration-500">
+                                ¡FELICIDADES!
+                            </h1>
+                            <div className={`text-5xl font-black uppercase ${lastScoringTeam === 1 ? 'text-blue-400' : 'text-red-400'} animate-bounce`}>
+                                EQUIPO {lastScoringTeam} ACERTÓ
+                            </div>
+                            <p className="text-2xl text-slate-400 font-bold tracking-widest uppercase animate-in fade-in duration-1000 delay-300">
+                                La palabra era: <span className="text-white">{currentWord}</span>
+                            </p>
+                        </div>
+                        <div className="flex justify-center gap-4 pt-8">
+                            <div className="h-3 w-3 bg-pink-500 rounded-full animate-bounce" />
+                            <div className="h-3 w-3 bg-purple-500 rounded-full animate-bounce [animation-delay:150ms]" />
+                            <div className="h-3 w-3 bg-indigo-500 rounded-full animate-bounce [animation-delay:300ms]" />
+                        </div>
                     </div>
                 )}
 
