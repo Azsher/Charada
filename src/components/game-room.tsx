@@ -215,13 +215,17 @@ export default function GameRoom({ code }: GameRoomProps) {
     // Auto-advance from celebration to next round
     useEffect(() => {
         if (phase === 'celebration' && player?.is_host) {
-            const timer = setTimeout(() => {
-                prevRoundRef.current = room.current_round; // Update ref to prevent double trigger
+            const timer = setTimeout(async () => {
+                // Update round to trigger next round
+                const newRound = room.current_round + 1;
+                await supabase.from('rooms').update({ current_round: newRound }).eq('id', room.id);
+                
+                prevRoundRef.current = newRound; // Update ref to prevent double trigger
                 runRound();
             }, 10000); // 10 seconds celebration
             return () => clearTimeout(timer);
         }
-    }, [phase, player?.is_host]);
+    }, [phase, player?.is_host, room?.current_round]);
 
     const getDeterministicIndex = (seedText: string, max: number) => {
         let hash = 0;
@@ -512,10 +516,6 @@ export default function GameRoom({ code }: GameRoomProps) {
         
         if (player?.is_host) {
             await supabase.from('rooms').update({ status: 'celebration' }).eq('id', room.id);
-            
-            // Update round after celebration
-            const newRound = room.current_round + 1;
-            await supabase.from('rooms').update({ current_round: newRound }).eq('id', room.id);
         }
     };
 
@@ -795,11 +795,17 @@ export default function GameRoom({ code }: GameRoomProps) {
                             </div>
                         ) : (
                             <div className="space-y-8 max-w-2xl mx-auto py-10">
-                                {/* Timer para espectadores */}
-                                <div className="bg-slate-900/80 p-4 rounded-2xl border border-white/5 backdrop-blur-md shadow-xl inline-block mx-auto">
-                                    <div className="text-xs opacity-40 uppercase font-bold tracking-widest mb-1">Tiempo Restante</div>
-                                    <div className={`text-4xl font-black font-mono ${performingTimer <= 10 ? 'text-red-500 animate-pulse' : 'text-pink-500'}`}>
-                                        {performingTimer}s
+                                {/* Mostrar número de equipo y timer para espectadores */}
+                                <div className="flex justify-between items-center bg-slate-900/80 p-6 rounded-2xl border border-white/5 backdrop-blur-md shadow-xl max-w-lg mx-auto">
+                                    <div className={`px-6 py-3 rounded-xl border ${player?.team_id === teams[0]?.id ? 'border-blue-500/50 bg-blue-500/10' : 'border-red-500/50 bg-red-500/10'}`}>
+                                        <div className={`text-xs uppercase font-bold tracking-wider ${player?.team_id === teams[0]?.id ? 'text-blue-400' : 'text-red-400'}`}>Tu Equipo</div>
+                                        <div className="text-4xl font-black">{player?.team_id === teams[0]?.id ? '1' : '2'}</div>
+                                    </div>
+                                    <div className="text-center">
+                                        <div className="text-xs opacity-40 uppercase font-bold tracking-widest mb-1">Tiempo Restante</div>
+                                        <div className={`text-4xl font-black font-mono ${performingTimer <= 10 ? 'text-red-500 animate-pulse' : 'text-pink-500'}`}>
+                                            {performingTimer}s
+                                        </div>
                                     </div>
                                 </div>
 
