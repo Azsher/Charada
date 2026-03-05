@@ -35,7 +35,7 @@ export default function RootLayout({
   return (
     <html lang="es" className="bg-slate-950">
       <body
-        className={`${geistSans.variable}${geistMono.variable} antialiased min-h-dvh bg-slate-950 text-white selection:bg-pink-500/30 overflow-x-hidden`}
+        className={`${geistSans.variable} ${geistMono.variable} antialiased min-h-screen bg-slate-950 text-white selection:bg-pink-500/30 overflow-x-hidden`}
       >
         {children}
         <Toaster position="top-center" richColors />

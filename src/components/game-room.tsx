@@ -4,13 +4,21 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardFooter } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Badge } from '@/components/ui/badge';
 import { toast } from 'sonner';
 import { QRCodeSVG } from 'qrcode.react';
-import { Loader2, Play, Users, Timer, Trophy, ArrowLeft, Zap, Sparkles, AlertTriangle } from 'lucide-react';
+import { Loader2, Play, Users, Timer, Trophy, ArrowLeft, Zap, Sparkles, AlertTriangle, Edit2 } from 'lucide-react';
+import {
+    Dialog,
+    DialogContent,
+    DialogHeader,
+    DialogTitle,
+    DialogDescription,
+    DialogFooter,
+} from "@/components/ui/dialog";
 
 interface GameRoomProps {
     code: string;
@@ -41,6 +49,10 @@ export default function GameRoom({ code }: GameRoomProps) {
     const [winnerTeam, setWinnerTeam] = useState<number | null>(null);
     const [showWord, setShowWord] = useState(true);
     const [winnerModal, setWinnerModal] = useState<{ name: string, type: 'category' | 'tiebreaker' } | null>(null);
+    const [isCustomModalOpen, setIsCustomModalOpen] = useState(false);
+    const [customWordInput, setCustomWordInput] = useState('');
+    const [activeCustomWord, setActiveCustomWord] = useState<string | null>(null);
+    const [customVotes, setCustomVotes] = useState<any[]>([]);
 
     const timerRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -130,6 +142,8 @@ export default function GameRoom({ code }: GameRoomProps) {
                     setPerformer2(payload.p2);
                 }
                 if (payload.type === 'word') setCurrentWord(payload.word);
+                if (payload.type === 'custom_word') setActiveCustomWord(payload.word);
+                if (payload.type === 'custom_vote') setCustomVotes(prev => [...prev, payload]);
                 if (payload.type === 'winner') setWinnerTeam(payload.team);
             })
             .subscribe();
@@ -243,10 +257,36 @@ export default function GameRoom({ code }: GameRoomProps) {
 
     const voteCategory = async (categoryId: string) => {
         if (selectedCategoryId) return;
+        if (categoryId === 'custom') {
+            setIsCustomModalOpen(true);
+            return;
+        }
         const { error } = await supabase.from('votes').insert({
             room_id: room.id, player_id: player.id, category_id: categoryId
         });
         if (!error) setSelectedCategoryId(categoryId);
+    };
+
+    const handleCustomWordConfirm = async () => {
+        if (!customWordInput) return;
+        // Broadcast the vote instead of inserting into DB to avoid UUID type error
+        broadcastEvent('custom_vote', { player_id: player.id, word: customWordInput });
+
+        // Attempt to save to "personalizados" table if it exists (swallow errors)
+        try {
+            await supabase.from('personalizados').insert({
+                room_id: room.id,
+                player_id: player.id,
+                word: customWordInput
+            });
+        } catch (e) { /* Table might not exist */ }
+
+        setSelectedCategoryId('custom');
+        setIsCustomModalOpen(false);
+        broadcastEvent('custom_word', { word: customWordInput });
+        setActiveCustomWord(customWordInput);
+        // Add to local votes for immediate feedback
+        setCustomVotes(prev => [...prev, { player_id: player.id, word: customWordInput }]);
     };
 
     const broadcastEvent = async (type: string, payload: any) => {
@@ -261,6 +301,16 @@ export default function GameRoom({ code }: GameRoomProps) {
         const counts: any = {};
         votes.forEach(v => counts[v.category_id] = (counts[v.category_id] || 0) + 1);
 
+        // Add custom votes to the count
+        // We deduplicate by player_id to avoid double counting if someone switches votes or broadcast-lag
+        const uniqueCustomPlayers = new Set();
+        customVotes.forEach(v => {
+            if (!uniqueCustomPlayers.has(v.player_id)) {
+                uniqueCustomPlayers.add(v.player_id);
+                counts['custom'] = (counts['custom'] || 0) + 1;
+            }
+        });
+
         // Find max votes
         let max = 0;
         Object.values(counts).forEach((c: any) => { if (c > max) max = c; });
@@ -272,6 +322,7 @@ export default function GameRoom({ code }: GameRoomProps) {
             // TIE BREAKER!
             await supabase.from('votes').delete().eq('room_id', room.id); // Clear DB votes
             setVotes([]);
+            setCustomVotes([]); // Clear virtual votes
             setTiebreakerCategoryIds(winners);
             setSelectedCategoryId(null);
             broadcastEvent('tiebreaker', { categoryIds: winners });
@@ -281,9 +332,9 @@ export default function GameRoom({ code }: GameRoomProps) {
         }
 
         const winnerCat = winners[0] || categories[0]?.id;
-        const winnerName = categories.find(c => c.id === winnerCat)?.name || "Categoría";
+        const winnerName = winnerCat === 'custom' ? "Personalizado" : (categories.find(c => c.id === winnerCat)?.name || "Categoría");
 
-        await supabase.from('rooms').update({ category_id: winnerCat }).eq('id', room.id);
+        await supabase.from('rooms').update({ category_id: winnerCat === 'custom' ? null : winnerCat }).eq('id', room.id);
         setWinnerModal({ name: winnerName.toUpperCase(), type: 'category' });
         setTimeout(() => setWinnerModal(null), 3000);
         runRound();
@@ -362,7 +413,9 @@ export default function GameRoom({ code }: GameRoomProps) {
         const { data: words } = await supabase.from('words').select('text').eq('category_id', catId).order('text', { ascending: true });
 
         let word = "Error: No words";
-        if (words && words.length > 0) {
+        if (catId === null || catId === 'custom') {
+            word = activeCustomWord || "Personalizado";
+        } else if (words && words.length > 0) {
             const seed = `${code}-${round}-${catId}`;
             const idx = getDeterministicIndex(seed, words.length);
             word = words[idx].text;
@@ -394,27 +447,42 @@ export default function GameRoom({ code }: GameRoomProps) {
 
     if (!player) {
         return (
-            <div className="min-h-dvh bg-indigo-950 flex items-center justify-center p-4">
-                <Card className="w-full max-w-md bg-white/5 border-white/10 text-white backdrop-blur-lg shadow-2xl">
-                    <CardHeader>
-                        <CardTitle className="text-2xl font-bold text-pink-400">Unirse a: {code}</CardTitle>
-                        <CardDescription className="text-indigo-200 text-lg">Introduce tu apodo para comenzar</CardDescription>
+            <div className="min-h-dvh bg-slate-950 flex items-center justify-center p-4 relative overflow-hidden">
+                {/* Background blobs */}
+                <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-pink-600/10 blur-[120px] rounded-full" />
+                <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-indigo-600/10 blur-[120px] rounded-full" />
+
+                <Card className="w-full max-w-md bg-slate-900/50 backdrop-blur-2xl border-white/5 text-white shadow-2xl animate-in fade-in zoom-in duration-500">
+                    <CardHeader className="text-center space-y-2">
+                        <CardTitle className="text-3xl font-black tracking-tight text-pink-400">Unirse a: {code}</CardTitle>
+                        <CardDescription className="text-slate-400 font-medium text-lg italic">Introduce tu apodo para comenzar</CardDescription>
                     </CardHeader>
-                    <CardContent className="space-y-4">
-                        <div className="space-y-2">
-                            <Label htmlFor="nickname" className="text-sm font-medium">Vuestro apodo</Label>
+                    <CardContent className="space-y-6 pt-4">
+                        <div className="space-y-3">
+                            <Label htmlFor="nickname" className="text-xs font-bold uppercase tracking-widest text-slate-500 ml-1">Vuestro apodo</Label>
                             <Input
                                 id="nickname"
                                 value={nickname}
                                 onChange={(e) => setNickname(e.target.value)}
                                 placeholder="Ej: MimoGenius"
-                                className="bg-white/10 border-white/20 text-white h-12 text-lg"
+                                className="bg-white/5 border-white/10 text-white placeholder:text-white/20 h-14 text-lg font-bold focus:ring-pink-500/50 px-6 rounded-2xl transition-all"
                             />
                         </div>
-                        <Button onClick={handleJoin} disabled={isJoining || !nickname} className="w-full bg-pink-600 hover:bg-pink-700 h-12 text-lg font-bold">
+                        <Button
+                            onClick={handleJoin}
+                            disabled={isJoining || !nickname}
+                            className="w-full bg-gradient-to-r from-pink-600 to-purple-600 hover:from-pink-500 hover:to-purple-500 h-16 text-xl font-black tracking-tight shadow-lg shadow-pink-600/20 active:scale-[0.98] transition-all rounded-2xl"
+                        >
                             {isJoining ? <Loader2 className="animate-spin" /> : 'ENTRAR AL JUEGO'}
                         </Button>
                     </CardContent>
+                    <CardFooter className="justify-center pb-8">
+                        <div className="flex gap-1.5">
+                            <div className="h-1 w-1 bg-pink-500/50 rounded-full" />
+                            <div className="h-1 w-1 bg-purple-500/50 rounded-full" />
+                            <div className="h-1 w-1 bg-indigo-500/50 rounded-full" />
+                        </div>
+                    </CardFooter>
                 </Card>
             </div>
         );
@@ -425,7 +493,7 @@ export default function GameRoom({ code }: GameRoomProps) {
             <div className="max-w-4xl mx-auto space-y-6">
 
                 {/* Header Stats */}
-                <div className="flex justify-between items-center bg-slate-900/80 p-4 rounded-2xl border border-white/5 backdrop-blur-md sticky top-4 z-50 shadow-xl">
+                <div className="flex justify-between items-center bg-slate-900/80 p-4 rounded-2xl border border-white/5 backdrop-blur-md sticky top-[calc(1rem+env(safe-area-inset-top))] z-50 shadow-xl">
                     <div className="flex gap-3 sm:gap-6 items-center">
                         {teams.map((t, i) => (
                             <div key={t.id} className={`px-4 py-2 rounded-xl border ${i === 0 ? 'border-blue-500/30 bg-blue-500/5' : 'border-red-500/30 bg-red-500/5'}`}>
@@ -512,6 +580,21 @@ export default function GameRoom({ code }: GameRoomProps) {
                                         </Button>
                                     );
                                 })}
+
+                            {/* Custom Category Option */}
+                            {(tiebreakerCategoryIds.length === 0 || tiebreakerCategoryIds.includes('custom')) && (
+                                <Button
+                                    disabled={!!selectedCategoryId && selectedCategoryId !== 'custom'}
+                                    onClick={() => voteCategory('custom')}
+                                    variant={selectedCategoryId === 'custom' ? "default" : "outline"}
+                                    className={`h-16 text-lg font-bold transition-all relative overflow-hidden ${selectedCategoryId === 'custom' ? "bg-pink-600 hover:bg-pink-600 scale-105 text-white" : "bg-white text-black border-dashed border-2 border-pink-200 hover:border-pink-400 hover:bg-pink-50/50"}`}
+                                >
+                                    <Edit2 className="mr-2 h-5 w-5" /> PERSONALIZADO
+                                    <Badge className={`absolute top-1 right-1 text-[10px] ${selectedCategoryId === 'custom' ? "bg-white/20 text-white" : "bg-slate-100 text-slate-600"}`}>
+                                        {Array.from(new Set(customVotes.map(v => v.player_id))).length}
+                                    </Badge>
+                                </Button>
+                            )}
                         </div>
                         {player?.is_host && <Button onClick={startLoop} className="mt-12 bg-green-600 font-black px-12 h-14 text-lg hover:bg-green-500">CERRAR VOTACIONES</Button>}
                     </Card>
@@ -668,6 +751,38 @@ export default function GameRoom({ code }: GameRoomProps) {
                     </div>
                 </div>
             )}
+
+            {/* Modal for Custom Word */}
+            <Dialog open={isCustomModalOpen} onOpenChange={setIsCustomModalOpen}>
+                <DialogContent className="bg-slate-900 border-white/10 text-white sm:max-w-[425px] rounded-3xl backdrop-blur-xl">
+                    <DialogHeader>
+                        <DialogTitle className="text-2xl font-black text-pink-400">Categoría Personalizada</DialogTitle>
+                        <DialogDescription className="text-slate-400">
+                            Escribe la palabra o frase que los mimos deberán representar.
+                        </DialogDescription>
+                    </DialogHeader>
+                    <div className="py-6 scroll-m-20">
+                        <Label htmlFor="custom-word" className="text-xs font-bold uppercase tracking-widest text-slate-500 mb-2 block">Palabra Secreta</Label>
+                        <Input
+                            id="custom-word"
+                            value={customWordInput}
+                            onChange={(e) => setCustomWordInput(e.target.value)}
+                            placeholder="Ej: Salto en paracaídas"
+                            className="bg-white/5 border-white/10 text-white h-14 text-lg font-bold rounded-2xl focus:ring-pink-500"
+                            autoFocus
+                        />
+                    </div>
+                    <DialogFooter>
+                        <Button
+                            onClick={handleCustomWordConfirm}
+                            disabled={!customWordInput}
+                            className="w-full bg-pink-600 hover:bg-pink-500 h-14 text-lg font-black rounded-2xl shadow-lg shadow-pink-600/20"
+                        >
+                            CONFIRMAR Y VOTAR
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
 
             <style jsx global>{`
         @keyframes glow {
