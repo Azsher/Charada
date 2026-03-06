@@ -62,6 +62,7 @@ export default function GameRoom({ code }: GameRoomProps) {
     const performingTimerRef = useRef<NodeJS.Timeout | null>(null);
     const celebrationTimerRef = useRef<NodeJS.Timeout | null>(null);
     const celebrationIntervalRef = useRef<NodeJS.Timeout | null>(null);
+    const celebrationStartedRef = useRef<boolean>(false);
 
     // Fetch initial data
     useEffect(() => {
@@ -243,7 +244,9 @@ export default function GameRoom({ code }: GameRoomProps) {
 
     // Auto-advance from celebration to next round
     useEffect(() => {
-        if (phase === 'celebration' && room?.id) {
+        if (phase === 'celebration' && room?.id && !celebrationStartedRef.current) {
+            celebrationStartedRef.current = true;
+            
             // Clear any existing timers
             if (celebrationIntervalRef.current) {
                 clearInterval(celebrationIntervalRef.current);
@@ -252,10 +255,11 @@ export default function GameRoom({ code }: GameRoomProps) {
             console.log('Starting celebration timer, is host:', player?.is_host);
             const roomId = room.id;
             const currentRound = room.current_round;
+            const isHost = player?.is_host;
             
             // All clients show the countdown
             setCelebrationTimer(5);
-            if (player?.is_host) {
+            if (isHost) {
                 broadcastEvent('celebration_timer', { value: 5 });
             }
             
@@ -265,7 +269,7 @@ export default function GameRoom({ code }: GameRoomProps) {
                 console.log('Celebration timer:', timeLeft);
                 setCelebrationTimer(timeLeft);
                 
-                if (player?.is_host) {
+                if (isHost) {
                     broadcastEvent('celebration_timer', { value: timeLeft });
                 }
                 
@@ -275,9 +279,9 @@ export default function GameRoom({ code }: GameRoomProps) {
                         celebrationIntervalRef.current = null;
                     }
                     
-                    console.log('Celebration ended, player is host:', player?.is_host);
+                    console.log('Celebration ended, player is host:', isHost);
                     
-                    if (player?.is_host) {
+                    if (isHost) {
                         // Host advances directly
                         console.log('Host advancing to next round');
                         const newRound = currentRound + 1;
@@ -288,6 +292,7 @@ export default function GameRoom({ code }: GameRoomProps) {
                                 console.error('Error updating round:', error);
                             } else {
                                 console.log('Round updated to:', newRound, 'calling runRound()');
+                                celebrationStartedRef.current = false;
                                 runRound();
                             }
                         });
@@ -302,6 +307,7 @@ export default function GameRoom({ code }: GameRoomProps) {
                                 console.error('Error updating round:', error);
                             } else {
                                 console.log('Non-host updated round to:', newRound, 'broadcasting advance signal');
+                                celebrationStartedRef.current = false;
                                 // Broadcast signal to host
                                 broadcastEvent('advance_round', { round: newRound });
                             }
@@ -317,8 +323,11 @@ export default function GameRoom({ code }: GameRoomProps) {
                     celebrationIntervalRef.current = null;
                 }
             };
+        } else if (phase !== 'celebration') {
+            // Reset flag when leaving celebration phase
+            celebrationStartedRef.current = false;
         }
-    }, [phase, player?.is_host, room?.id]);
+    }, [phase, room?.id]);
 
     const getDeterministicIndex = (seedText: string, max: number) => {
         let hash = 0;
