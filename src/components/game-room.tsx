@@ -55,11 +55,13 @@ export default function GameRoom({ code }: GameRoomProps) {
     const [activeCustomWord, setActiveCustomWord] = useState<string | null>(null);
     const [customVotes, setCustomVotes] = useState<any[]>([]);
     const [performingTimer, setPerformingTimer] = useState<number>(45);
+    const [celebrationTimer, setCelebrationTimer] = useState<number>(5);
     const [scoreButtonDisabled, setScoreButtonDisabled] = useState<boolean>(false);
 
     const timerRef = useRef<NodeJS.Timeout | null>(null);
     const performingTimerRef = useRef<NodeJS.Timeout | null>(null);
     const celebrationTimerRef = useRef<NodeJS.Timeout | null>(null);
+    const celebrationIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
     // Fetch initial data
     useEffect(() => {
@@ -136,6 +138,24 @@ export default function GameRoom({ code }: GameRoomProps) {
             .on('broadcast', { event: 'game_event' }, ({ payload }) => {
                 if (payload.type === 'countdown') setCountdown(payload.value);
                 if (payload.type === 'performing_timer') setPerformingTimer(payload.value);
+                if (payload.type === 'celebration_timer') setCelebrationTimer(payload.value);
+                if (payload.type === 'stop_performing_timer') {
+                    if (performingTimerRef.current) {
+                        clearInterval(performingTimerRef.current);
+                        performingTimerRef.current = null;
+                    }
+                }
+                if (payload.type === 'advance_round') {
+                    // Host receives signal to advance round
+                    console.log('Received advance_round signal, is host:', player?.is_host);
+                    if (player?.is_host) {
+                        console.log('Host executing runRound from broadcast');
+                        // Small delay to ensure celebration phase is set
+                        setTimeout(() => {
+                            runRound();
+                        }, 100);
+                    }
+                }
                 if (payload.type === 'score_button_state') setScoreButtonDisabled(payload.disabled);
                 if (payload.type === 'celebration') {
                     setLastScoringTeam(payload.team);
@@ -167,6 +187,7 @@ export default function GameRoom({ code }: GameRoomProps) {
             if (timerRef.current) clearInterval(timerRef.current);
             if (performingTimerRef.current) clearInterval(performingTimerRef.current);
             if (celebrationTimerRef.current) clearTimeout(celebrationTimerRef.current);
+            if (celebrationIntervalRef.current) clearInterval(celebrationIntervalRef.current);
         };
     }, [code, room?.id, player?.id, router]);
 
@@ -222,35 +243,78 @@ export default function GameRoom({ code }: GameRoomProps) {
 
     // Auto-advance from celebration to next round
     useEffect(() => {
-        if (phase === 'celebration' && player?.is_host && room?.id) {
-            // Clear any existing timer
-            if (celebrationTimerRef.current) {
-                clearTimeout(celebrationTimerRef.current);
+        if (phase === 'celebration' && room?.id) {
+            // Clear any existing timers
+            if (celebrationIntervalRef.current) {
+                clearInterval(celebrationIntervalRef.current);
             }
             
-            console.log('Starting celebration timer, current round:', room.current_round);
-            const currentRound = room.current_round;
+            console.log('Starting celebration timer, is host:', player?.is_host);
             const roomId = room.id;
+            const currentRound = room.current_round;
             
-            celebrationTimerRef.current = setTimeout(async () => {
-                console.log('Celebration ended, advancing to next round');
-                const newRound = currentRound + 1;
+            // All clients show the countdown
+            setCelebrationTimer(5);
+            if (player?.is_host) {
+                broadcastEvent('celebration_timer', { value: 5 });
+            }
+            
+            let timeLeft = 5;
+            celebrationIntervalRef.current = setInterval(() => {
+                timeLeft--;
+                console.log('Celebration timer:', timeLeft);
+                setCelebrationTimer(timeLeft);
                 
-                // Update round in database
-                const { error } = await supabase.from('rooms').update({ current_round: newRound }).eq('id', roomId);
-                if (error) {
-                    console.error('Error updating round:', error);
-                } else {
-                    console.log('Round updated to:', newRound);
-                    prevRoundRef.current = newRound;
-                    runRound();
+                if (player?.is_host) {
+                    broadcastEvent('celebration_timer', { value: timeLeft });
                 }
-            }, 10000); // 10 seconds celebration
+                
+                if (timeLeft <= 0) {
+                    if (celebrationIntervalRef.current) {
+                        clearInterval(celebrationIntervalRef.current);
+                        celebrationIntervalRef.current = null;
+                    }
+                    
+                    console.log('Celebration ended, player is host:', player?.is_host);
+                    
+                    if (player?.is_host) {
+                        // Host advances directly
+                        console.log('Host advancing to next round');
+                        const newRound = currentRound + 1;
+                        prevRoundRef.current = newRound;
+                        
+                        supabase.from('rooms').update({ current_round: newRound }).eq('id', roomId).then(({ error }) => {
+                            if (error) {
+                                console.error('Error updating round:', error);
+                            } else {
+                                console.log('Round updated to:', newRound, 'calling runRound()');
+                                runRound();
+                            }
+                        });
+                    } else {
+                        // Non-host signals host to advance
+                        console.log('Non-host signaling host to advance round');
+                        const newRound = currentRound + 1;
+                        
+                        // Update round in database so host can pick it up
+                        supabase.from('rooms').update({ current_round: newRound }).eq('id', roomId).then(({ error }) => {
+                            if (error) {
+                                console.error('Error updating round:', error);
+                            } else {
+                                console.log('Non-host updated round to:', newRound, 'broadcasting advance signal');
+                                // Broadcast signal to host
+                                broadcastEvent('advance_round', { round: newRound });
+                            }
+                        });
+                    }
+                }
+            }, 1000);
             
             return () => {
                 console.log('Cleaning up celebration timer');
-                if (celebrationTimerRef.current) {
-                    clearTimeout(celebrationTimerRef.current);
+                if (celebrationIntervalRef.current) {
+                    clearInterval(celebrationIntervalRef.current);
+                    celebrationIntervalRef.current = null;
                 }
             };
         }
@@ -537,9 +601,14 @@ export default function GameRoom({ code }: GameRoomProps) {
         setScoreButtonDisabled(true);
         broadcastEvent('score_button_state', { disabled: true });
         
-        if (player?.is_host && performingTimerRef.current) {
+        // Stop the performing timer for all clients
+        if (performingTimerRef.current) {
             clearInterval(performingTimerRef.current);
+            performingTimerRef.current = null;
         }
+        
+        // Broadcast to stop timer on all clients
+        broadcastEvent('stop_performing_timer', {});
         
         const team = teams[teamIndex];
         await supabase
@@ -547,16 +616,14 @@ export default function GameRoom({ code }: GameRoomProps) {
             .update({ score: team.score + 1 })
             .eq('id', team.id);
 
-        // Show celebration screen for all players
+        // Show celebration screen for all players (including host)
         setLastScoringTeam(teamIndex + 1);
+        setPhase('celebration'); // Set phase locally for immediate feedback
         broadcastEvent('celebration', { team: teamIndex + 1 });
         
-        // Only host updates the room status
+        // Host also updates the room status in database
         if (player?.is_host) {
             await supabase.from('rooms').update({ status: 'celebration' }).eq('id', room.id);
-        } else {
-            // Non-host players also need to see celebration, so set phase locally
-            setPhase('celebration');
         }
     };
 
@@ -870,6 +937,14 @@ export default function GameRoom({ code }: GameRoomProps) {
 
                 {phase === 'celebration' && (
                     <div className="text-center space-y-12 py-20 animate-in zoom-in-50 duration-700">
+                        {/* Timer de celebración */}
+                        <div className="absolute top-24 right-8 bg-slate-900/80 p-4 rounded-2xl border border-white/5 backdrop-blur-md shadow-xl">
+                            <div className="text-xs opacity-40 uppercase font-bold tracking-widest mb-1">Siguiente ronda en</div>
+                            <div className={`text-4xl font-black font-mono ${celebrationTimer <= 2 ? 'text-yellow-500 animate-pulse' : 'text-pink-500'}`}>
+                                {celebrationTimer}s
+                            </div>
+                        </div>
+                        
                         <div className="relative inline-block">
                             <Sparkles className="h-32 w-32 mx-auto text-yellow-400 animate-pulse" />
                             <div className="absolute inset-0 bg-yellow-400/30 blur-[100px] rounded-full animate-pulse" />
